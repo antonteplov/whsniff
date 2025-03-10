@@ -93,7 +93,7 @@ static const pcap_hdr_t pcap_hdr = {
 };
 
 static volatile unsigned int signal_exit = 0;
-
+static int counter = 0;
 //--------------------------------------------
 static uint16_t update_crc_ccitt(uint16_t crc, uint8_t c);
 static uint16_t ieee802154_crc16(uint8_t *tvb, uint32_t offset, uint32_t len);
@@ -204,7 +204,13 @@ static int packet_handler(unsigned char *buf, int cnt, uint8_t keep_original_fcs
 		
 	return usb_len + sizeof(usb_header_type);
 }
-
+//-------------------------------------------
+// Обработчик сигнала SIGALRM
+void timer_handler(int signum) {
+    printf("%d\n",counter);
+	signal_exit = 1;
+//    alarm(10);  // Перезапускаем таймер на 10 секунду
+}
 //--------------------------------------------
 void signal_handler(int sig)
 {
@@ -214,7 +220,7 @@ void signal_handler(int sig)
 //--------------------------------------------
 void print_usage()
 {
-    printf("Usage: whsniff -c <channel> [-k] [-f] [-h] [-d]\n");
+    printf("Usage: whsniff -c <channel> [-k] [-f] [-h] [-d] [-n delay]\n");
     printf("\n");
     printf("Where\n");
     printf("\t-c <channel> - Zigbee channel number (11 to 26)\n");
@@ -222,7 +228,9 @@ void print_usage()
     printf("\t-f - dump to file instead of stdout (handy for long sniffs with -h/-d options)\n");
     printf("\t-h - start a new dump file evey hour (used with -f)\n");
     printf("\t-d - start a new dump file evey day (used with -f)\n");
-}
+	printf("\t-n - delay in sec , should be > 0 \n");
+}   
+
 
 
 //--------------------------------------------
@@ -349,7 +357,7 @@ void close_usb_sniffer(libusb_device_handle *handle)
 }
 
 //--------------------------------------------
-FILE * restart_pcap_file(FILE * prev_file, uint8_t restart_hourly, uint8_t restart_daily)
+FILE * restart_pcap_file(FILE * prev_file, uint8_t restart_hourly, uint8_t restart_daily, uint8_t pps_count)
 {
 	static int last_hour = -1;
 	static int last_day = -1;
@@ -395,9 +403,15 @@ FILE * restart_pcap_file(FILE * prev_file, uint8_t restart_hourly, uint8_t resta
 	char filename[100];
 	sprintf(filename, "whsniff-%d-%02d-%02d-%02d-%02d-%02d.pcap", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
 
-	fprintf(stderr, "Sniffing to %s\n", filename);
-	file = fopen(filename, "wb");
-
+	
+	if ( pps_count == 0 ) {
+		fprintf(stderr, "Sniffing to %s\n", filename);
+		file = fopen(filename, "wb");
+		}
+	else {
+		file = fopen("/dev/null","wb");
+		//fprintf(stderr, "Sniffing to null");
+		}
 	// Write PCAP header
 	fwrite(&pcap_hdr, sizeof(pcap_hdr), 1, file);
 	fflush(file);
@@ -413,6 +427,8 @@ int main(int argc, char *argv[])
 	uint8_t dump_to_file = 0;
 	uint8_t restart_hourly = 0;
 	uint8_t restart_daily = 0;
+	uint8_t pps_calc = 0;
+	uint8_t delay = 3;
 	int option;
 	static unsigned char usb_buf[BUF_SIZE];
 	static int usb_cnt;
@@ -427,9 +443,14 @@ int main(int argc, char *argv[])
 	signal(SIGTERM, signal_handler);
 	// pipe closed
 	signal(SIGPIPE, signal_handler);
+	
+	if (signal(SIGALRM, timer_handler) == SIG_ERR) {
+        perror("Ошибка при установке обработчика сигнала");
+        exit(EXIT_FAILURE);
+    }
 
 	option = 0;
-	while ((option = getopt(argc, argv, "c:kfhd")) != -1)
+	while ((option = getopt(argc, argv, "c:kfhdn:")) != -1)
 	{
 		switch (option)
 		{
@@ -457,6 +478,14 @@ int main(int argc, char *argv[])
 			case 'd':
 				restart_daily = 1;
 				break;
+			case 'n':
+				pps_calc = 1;
+				delay = (uint8_t) atoi(optarg);
+				if (delay == 0) {
+				print_usage();
+				exit(EXIT_FAILURE);	
+				} 
+				break;
 			default:
 				print_usage();
 				exit(EXIT_FAILURE);
@@ -476,10 +505,12 @@ int main(int argc, char *argv[])
 		exit(EXIT_FAILURE);
 	}
 
+	if(pps_calc) alarm(delay);
+	
 	while (!signal_exit)
 	{
 		// restart new PCAP file (if needed)
-		file = restart_pcap_file(dump_to_file ? file /*Open new file*/ : stdout, restart_hourly, restart_daily);
+		file = restart_pcap_file(dump_to_file ? file /*Open new file*/ : stdout, restart_hourly, restart_daily, pps_calc);
 
 		// Receive and process a piece of data from USB
 		int res = libusb_bulk_transfer(handle, 0x83, (unsigned char *)&usb_buf, BUF_SIZE, &usb_cnt, 10000);
@@ -508,6 +539,8 @@ int main(int argc, char *argv[])
 			if (res < 0)
 				break;
 			recv_cnt -= res;
+//			printf("res: %d\n", res);
+ 			if( pps_calc && res > 4 ) counter++;	  
 			if (recv_cnt == 0)
 				break;
 			memmove(&recv_buf[0], &recv_buf[res], recv_cnt);
